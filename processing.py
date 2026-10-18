@@ -228,7 +228,12 @@ def load_model(name):
     if name == "DDColor (tiny)":
         import onnxruntime as ort
         path = download(DDCOLOR_URLS, DDCOLOR_FILE, 100_000_000)
-        return ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+        opts = ort.SessionOptions()
+        opts.enable_cpu_mem_arena = False   # give memory back after each run
+        opts.intra_op_num_threads = 2       # free hosting has 2 cores
+        return ort.InferenceSession(path, sess_options=opts, providers=["CPUExecutionProvider"])
+    import torch
+    torch.set_num_threads(2)
     import zhang_models
     model = zhang_models.eccv16() if name == "ECCV 2016" else zhang_models.siggraph17()
     return model.eval()
@@ -266,11 +271,18 @@ def predict_ab(name, model, img):
     return ab.transpose(1, 2, 0)
 
 
+def apply_ab(img, ab, strength=1.0):
+    """Resize predicted a, b up to the photo, scale by strength, join with the full-size L.
+
+    Cheap (no network), so the strength slider never reruns the model."""
+    h, w = img.shape[:2]
+    ab = cv2.resize(ab, (w, h), interpolation=cv2.INTER_LINEAR)
+    return L_ab_to_bgr(bgr_to_L(img), ab * float(strength))
+
+
 def colorize(img, name, model, strength=1.0):
     """Predict a, b at low resolution, resize them up, keep the full-size original L."""
-    h, w = img.shape[:2]
-    ab = cv2.resize(predict_ab(name, model, img), (w, h), interpolation=cv2.INTER_LINEAR)
-    return L_ab_to_bgr(bgr_to_L(img), ab * float(strength))
+    return apply_ab(img, predict_ab(name, model, img), strength)
 
 
 def comparison_grid(images, titles, height=420):

@@ -11,14 +11,18 @@ import processing as p
 
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False, max_entries=1)
 def get_model(name):
+    """Only ONE model stays in memory; picking another one unloads the previous."""
+    import gc
+    gc.collect()
     return p.load_model(name)
 
 
-@st.cache_data(show_spinner=False, max_entries=8)
-def colorized(image, name, strength):
-    return p.colorize(image, name, get_model(name), strength)
+@st.cache_data(show_spinner=False, max_entries=12)
+def predicted_ab(image, name):
+    """The slow part (the network), remembered per photo and model. Small: just a, b."""
+    return p.predict_ab(name, get_model(name), image)
 
 
 def run_colorize(image, name, strength):
@@ -31,7 +35,8 @@ def run_colorize(image, name, strength):
                else f"Downloading {name} (first time only, about 130 MB)…")
     try:
         with st.spinner(message):
-            return colorized(image, name, strength)
+            ab = predicted_ab(image, name)
+        return p.apply_ab(image, ab, strength)  # strength changes skip the network
     except Exception as exc:
         st.error(f"{name} failed: {exc}")
         return None
@@ -281,6 +286,7 @@ with st.expander("🎨 Compare all three colorization models"):
     st.caption("Runs ECCV 2016, SIGGRAPH 2017 and DDColor on the original image and lines them up "
                "like the last cell of the homework notebook. Uses the Color strength slider.")
     img_key = (hashlib.md5(img.tobytes()).hexdigest(), strength)
+    st.caption("The models run one after another, and only one is kept in memory at a time.")
     if st.button("Run all three models", key=K("compare_run")):
         results = [run_colorize(img, name, strength) for name in p.MODELS]
         if all(r is not None for r in results):
