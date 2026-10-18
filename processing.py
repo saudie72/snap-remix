@@ -155,6 +155,186 @@ def draw_box(img, alpha, x_range, y_range, color_bgr, shape="Rectangle"):
             cv2.circle(alpha, center, radius, 255, thickness, cv2.LINE_AA)
 
 
+# --------------------------------------------------- AI colorization (Lab)
+# The three models from the homework notebook. All of them keep the photo's
+# lightness (L in Lab) and predict only the two color channels (a, b).
+#   ECCV 2016 / SIGGRAPH 2017: Zhang et al., PyTorch (zhang_models.py), 256x256 input
+#   DDColor (tiny):            Kang et al. 2023, ONNX file run with onnxruntime, 512x512 input
+MODELS = ["ECCV 2016", "SIGGRAPH 2017", "DDColor (tiny)"]
+MODEL_INFO = {
+    "ECCV 2016": "Zhang et al. 2016: classifies each spot into one of 313 colors. ~123 MB.",
+    "SIGGRAPH 2017": "Zhang et al. 2017: a U-Net trained to predict color directly. ~130 MB.",
+    "DDColor (tiny)": "Kang et al. 2023 (ICCV): dual decoders; the most realistic of the three. ~135 MB.",
+}
+DDCOLOR_FILE = "ddcolor-tiny-fp16.onnx"
+DDCOLOR_URLS = ["https://huggingface.co/edgetools/ddcolor/resolve/main/ddcolor-tiny-fp16.onnx"]
+
+
+def cache_dir():
+    """Model files live outside the app folder so they never end up in the repo."""
+    import os
+    path = os.path.join(os.path.expanduser("~"), ".cache", "snap-remix")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def download(urls, filename, min_bytes):
+    """Download a model file once (trying each mirror) and return its path."""
+    import os
+    import urllib.request
+
+    path = os.path.join(cache_dir(), filename)
+    if os.path.exists(path) and os.path.getsize(path) >= min_bytes:
+        return path
+    errors = []
+    for url in urls:
+        tmp = path + ".part"
+        try:
+            urllib.request.urlretrieve(url, tmp)
+            if os.path.getsize(tmp) >= min_bytes:
+                os.replace(tmp, path)
+                return path
+            errors.append(f"{url}: file too small")
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+    raise RuntimeError(f"Couldn't download {filename}. " + " | ".join(errors))
+
+
+def model_available(name):
+    """Is the library this model needs installed?"""
+    import importlib.util
+    lib = "onnxruntime" if name == "DDColor (tiny)" else "torch"
+    return importlib.util.find_spec(lib) is not None
+
+
+def model_downloaded(name):
+    import os
+    if name == "DDColor (tiny)":
+        return os.path.exists(os.path.join(cache_dir(), DDCOLOR_FILE))
+    want = "colorization_release_v2" if name == "ECCV 2016" else "siggraph17"
+    try:  # only used to pick the spinner message, so never let it fail
+        import torch
+        ckpt = os.path.join(torch.hub.get_dir(), "checkpoints")
+        return os.path.isdir(ckpt) and any(f.startswith(want) for f in os.listdir(ckpt))
+    except Exception:
+        return False
+
+
+def load_model(name):
+    """Build a model (downloading its weights the first time)."""
+    if name == "DDColor (tiny)":
+        import onnxruntime as ort
+        path = download(DDCOLOR_URLS, DDCOLOR_FILE, 100_000_000)
+        return ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    import zhang_models
+    model = zhang_models.eccv16() if name == "ECCV 2016" else zhang_models.siggraph17()
+    return model.eval()
+
+
+def bgr_to_L(img):
+    """Lightness channel (0-100) of a BGR uint8 image, OpenCV float Lab."""
+    rgb = img[:, :, ::-1].astype(np.float32) / 255.0
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2Lab)[:, :, 0]
+
+
+def L_ab_to_bgr(L, ab):
+    """Join the original full-size L with predicted a, b and go back to BGR uint8."""
+    lab = np.concatenate([L[:, :, None], ab.astype(np.float32)], axis=2)
+    rgb = cv2.cvtColor(lab, cv2.COLOR_Lab2RGB)
+    return np.uint8(np.clip(rgb, 0, 1)[:, :, ::-1] * 255 + 0.5)
+
+
+def predict_ab(name, model, img):
+    """Run one model; returns a, b at the model's own resolution (H x W x 2)."""
+    if name == "DDColor (tiny)":
+        # 512x512, a gray RGB rebuilt from L (a = b = 0), no ImageNet normalization
+        small = cv2.resize(img, (512, 512), interpolation=cv2.INTER_AREA)
+        L = bgr_to_L(small)
+        gray = cv2.cvtColor(np.dstack([L, np.zeros_like(L), np.zeros_like(L)]), cv2.COLOR_Lab2RGB)
+        x = np.ascontiguousarray(gray.transpose(2, 0, 1)[None], dtype=np.float32)
+        ab = model.run(None, {model.get_inputs()[0].name: x})[0][0]
+        return ab.transpose(1, 2, 0)
+    # Zhang models: L of the photo shrunk to 256x256 (like preprocess_img in the notebook)
+    import torch
+    small = cv2.resize(img, (256, 256), interpolation=cv2.INTER_CUBIC)
+    L = torch.from_numpy(bgr_to_L(small))[None, None]
+    with torch.no_grad():
+        ab = model(L)[0].cpu().numpy()
+    return ab.transpose(1, 2, 0)
+
+
+def colorize(img, name, model, strength=1.0):
+    """Predict a, b at low resolution, resize them up, keep the full-size original L."""
+    h, w = img.shape[:2]
+    ab = cv2.resize(predict_ab(name, model, img), (w, h), interpolation=cv2.INTER_LINEAR)
+    return L_ab_to_bgr(bgr_to_L(img), ab * float(strength))
+
+
+def comparison_grid(images, titles, height=420):
+    """Original + each model's result in one row with a title above each (like the notebook)."""
+    tiles = []
+    for im, title in zip(images, titles):
+        w = int(im.shape[1] * height / im.shape[0])
+        tile = cv2.copyMakeBorder(cv2.resize(im, (w, height), interpolation=cv2.INTER_AREA),
+                                  48, 12, 12, 12, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+        (tw, _), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+        cv2.putText(tile, title, ((tile.shape[1] - tw) // 2, 34), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9, (40, 40, 40), 2, cv2.LINE_AA)
+        tiles.append(tile)
+    return np.hstack(tiles)
+
+
+def looks_black_and_white(img, tolerance=12):
+    """True when the three channels are (almost) identical."""
+    small = cv2.resize(img, (200, int(200 * img.shape[0] / img.shape[1]) or 1))
+    spread = small.max(axis=2).astype(int) - small.min(axis=2).astype(int)
+    return float(np.percentile(spread, 95)) <= tolerance
+
+
+# ------------------------------------------------------ equalization & histograms
+EQUALIZE = ["Off", "Brightness only (HSV V channel)", "Each color channel (false colors)"]
+
+
+def equalize(img, mode):
+    """Histogram equalization: spread the brightness levels over 0-255."""
+    if mode == EQUALIZE[1]:
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        hsv[:, :, 2] = cv2.equalizeHist(hsv[:, :, 2])
+        return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+    if mode == EQUALIZE[2]:
+        out = np.zeros_like(img)
+        for i in range(3):
+            out[:, :, i] = cv2.equalizeHist(img[:, :, i])
+        return out
+    return img
+
+
+def histograms(img, mask=None):
+    """256-bin count per channel (B, G, R) with cv2.calcHist; mask = only white pixels."""
+    if mask is not None:
+        mask = np.uint8(mask > 0) * 255
+    return np.column_stack([
+        cv2.calcHist([img], [c], mask, [256], [0, 256]).ravel() for c in range(3)
+    ])
+
+
+def side_by_side(left, right, gap=16):
+    """Original and result next to each other on white, for handing in both."""
+    def solid(x):
+        if x.shape[2] == 4:
+            a = x[:, :, 3:4].astype(np.float32) / 255
+            return (x[:, :, :3] * a + 255 * (1 - a)).astype(np.uint8)
+        return x
+    left, right = solid(left), solid(right)
+    right = cv2.resize(right, (int(right.shape[1] * left.shape[0] / right.shape[0]), left.shape[0]))
+    h = left.shape[0]
+    spacer = np.full((h, gap, 3), 255, np.uint8)
+    return np.hstack([left, spacer, right])
+
+
 # ------------------------------------------------------------- presets
 PRESETS = ["None", "Golden Hour", "Noir", "Pop Art", "Glitch", "Scan (clean document)"]
 
